@@ -32,7 +32,13 @@ fn handle_connection(mut stream: TcpStream) -> std::io::Result<()> {
         value => {
             if value.contains("GET /sleep") && value.contains("HTTP/1.1") {
                 let mut parts = value.split_ascii_whitespace();
-                let sleep_time: u64 = parts.nth(1).unwrap().replace("/sleep", "").parse().unwrap();
+                let sleep_time: u64 = match parts.nth(1).unwrap().replace("/sleep", "").parse() {
+                    Ok(time) => time,
+                    Err(e) => {
+                        eprintln!("Error on parsing sleep time: {:#?}", e);
+                        5
+                    }
+                };
                 thread::sleep(time::Duration::from_secs(sleep_time.min(10)));
                 ("HTTP/1.1 200 OK", "index.html")
             } else {
