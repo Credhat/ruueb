@@ -1,17 +1,82 @@
 use core::time;
+use ruueb::operator;
 use std::{
     env, fs,
-    io::{BufRead, BufReader, Write},
-    iter::Once,
-    mem::take,
+    io::{self, BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
     path::PathBuf,
-    sync::{
-        mpsc::{self, Receiver},
-        Arc, Mutex,
-    },
+    sync::{mpsc, Arc, Mutex},
     thread,
+    time::Duration,
 };
+fn handle_connection_new(mut stream: TcpStream) -> io::Result<()> {
+    let mut buf_reader = BufReader::new(&mut stream);
+    let request_line = buf_reader.by_ref().lines().nth(0).unwrap().unwrap();
+
+    let mut html_path: PathBuf;
+    let current_path = env::current_dir()?;
+    html_path = PathBuf::from(current_path);
+    html_path.push("assets/html/");
+
+    let parts: Vec<&str> = request_line.split_whitespace().collect();
+    let (method, path, _version) = (parts[0], parts[1], parts[2]);
+
+    let (header, html_file) = match (method, path) {
+        ("GET", "/") => ("HTTP/1.1 200 OK", "index.html"),
+        ("GET", "/sleep") => {
+            thread::sleep(Duration::from_secs(5));
+            ("HTTP/1.1 200 OK", "index.html")
+        }
+        ("POST", "/add") => {
+            let body = get_request_body(&mut buf_reader)?;
+            operator::add_product(&body)?;
+            ("HTTP/1.1 200 OK", "index.html")
+        }
+        ("DELETE", "/delete") => {
+            let body = get_request_body(&mut buf_reader)?;
+            operator::delete_product(&body)?;
+            ("HTTP/1.1 200 OK", "index.html")
+        }
+        ("GET", "/products") => {
+            let mut products_output = Vec::new();
+            operator::read_products(&mut products_output, true)?;
+            let products_content = String::from_utf8(products_output).unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                products_content.len(),
+                products_content
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            return Ok(());
+        }
+        _ => ("HTTP/1.1 404 NOT FOUND", "404.html"),
+    };
+
+    html_path.push(html_file);
+    let content = fs::read_to_string(html_path)?;
+    let len_content = content.len();
+    let response = format!("{header}\r\nContent-Length: {len_content}\r\n\r\n{content}");
+    stream.write_all(response.as_bytes()).unwrap();
+    Ok(())
+}
+
+fn get_request_body(buf_reader: &mut BufReader<&mut TcpStream>) -> std::io::Result<String> {
+    let mut body = String::new();
+    let mut content_length = 0;
+    for line in buf_reader.by_ref().lines() {
+        let line = line?;
+        if line.is_empty() {
+            break;
+        }
+        if line.starts_with("Content-Length:") {
+            content_length = line[16..].trim().parse().unwrap();
+        }
+    }
+    buf_reader
+        .take(content_length as u64)
+        .read_to_string(&mut body)?;
+    Ok(body)
+}
 
 fn handle_connection(mut stream: TcpStream) -> std::io::Result<()> {
     // handle the connection here
@@ -72,7 +137,8 @@ fn main() -> std::io::Result<()> {
         match stream {
             Ok(stream) => {
                 task_pool.execute(|| {
-                    handle_connection(stream).unwrap();
+                    // handle_connection(stream).unwrap();
+                    handle_connection_new(stream).unwrap();
                 });
                 // thread::spawn(|| {
                 //     handle_connection(stream).unwrap();
