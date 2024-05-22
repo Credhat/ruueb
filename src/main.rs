@@ -2,8 +2,14 @@ use core::time;
 use std::{
     env, fs,
     io::{BufRead, BufReader, Write},
+    iter::Once,
+    mem::take,
     net::{TcpListener, TcpStream},
     path::PathBuf,
+    sync::{
+        mpsc::{self, Receiver},
+        Arc, Mutex,
+    },
     thread,
 };
 
@@ -39,7 +45,7 @@ fn handle_connection(mut stream: TcpStream) -> std::io::Result<()> {
                         5
                     }
                 };
-                thread::sleep(time::Duration::from_secs(sleep_time.min(10)));
+                thread::sleep(time::Duration::from_secs(sleep_time.min(60)));
                 ("HTTP/1.1 200 OK", "index.html")
             } else {
                 ("HTTP/1.1 404 NOT FOUND", "404.html")
@@ -52,7 +58,7 @@ fn handle_connection(mut stream: TcpStream) -> std::io::Result<()> {
     let len_content = content.len();
     let response = format!("{header}\r\nContent-Length: {len_content}\r\n\r\n{content}");
     stream.write_all(response.as_bytes()).unwrap();
-    println!("Request: {:#?}", request_line);
+    // println!("Request: {:#?}", request_line);
     Ok(())
 }
 
@@ -60,11 +66,17 @@ fn main() -> std::io::Result<()> {
     let base_server = ServerAddr::local_at(7089);
 
     let listener = TcpListener::bind(base_server.to_bind_string())?;
+    let task_pool = ThreadPool::new(4);
 
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                handle_connection(stream)?;
+                task_pool.execute(|| {
+                    handle_connection(stream).unwrap();
+                });
+                // thread::spawn(|| {
+                //     handle_connection(stream).unwrap();
+                // });
             }
             Err(e) => {
                 /* connection failed */
@@ -94,5 +106,86 @@ impl ServerAddr {
 
     fn to_bind_string(&self) -> String {
         format!("{}:{}", self.ip, self.port)
+    }
+}
+
+type Job = Box<dyn FnOnce() + Send + 'static>;
+
+struct ThreadPool {
+    worker_num: usize,
+    workers: Vec<Worker>,
+    sender: Option<mpsc::Sender<Job>>,
+}
+
+// struct Job {}
+
+impl ThreadPool {
+    pub fn new(worker_num: usize) -> ThreadPool {
+        assert!(worker_num > 0);
+        let (sender, receiver) = mpsc::channel();
+
+        let receiver: Arc<Mutex<mpsc::Receiver<Job>>> = Arc::new(Mutex::new(receiver));
+
+        let mut workers = Vec::with_capacity(worker_num);
+
+        for id in 0..worker_num {
+            workers.push(Worker::new(id, Arc::clone(&receiver)));
+        }
+
+        ThreadPool {
+            worker_num,
+            workers,
+            sender: Some(sender),
+        }
+    }
+
+    pub fn execute<F>(&self, task: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let job = Box::new(task);
+        self.sender.as_ref().unwrap().send(job).unwrap();
+    }
+}
+
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        drop(self.sender.take());
+
+        for worker in &mut self.workers {
+            println!("Shutting down worker {}", worker.id);
+
+            if let Some(thread) = worker.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+}
+
+struct Worker {
+    id: usize,
+    thread: Option<thread::JoinHandle<()>>,
+    // receiver: mpsc::Receiver<Job>,
+}
+
+impl Worker {
+    fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Job>>>) -> Worker {
+        let thread = thread::spawn(move || loop {
+            let message = receiver.lock().unwrap().recv();
+            match message {
+                Ok(job) => {
+                    println!("Worker {id} got a job; let's executing.");
+                    job();
+                }
+                Err(_) => {
+                    println!("Worker {id} disconnected; Shutting down.");
+                    break;
+                }
+            }
+        });
+        Worker {
+            id,
+            thread: Some(thread),
+        }
     }
 }
